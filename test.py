@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from model import PointTransformerV3
+from stability_predictor import StabilityPredictor
 
 _PC_SIZE = 256
 _EPOCHS = 100
@@ -39,19 +40,27 @@ env_pcs, obj_pcs = load_pc_data("isaac_pc_data.npz")
 #   "FlashAttention only supports Ampere GPUs or newer."
 # TODO: go back to commented out model initialization below once GPU is upgraded?
 #
-#model = PointTransformerV3(in_channels=3, cls_mode=True).to(_DEVICE)
-model = PointTransformerV3(
+#backbone = PointTransformerV3(in_channels=3, cls_mode=True).to(_DEVICE)
+backbone = PointTransformerV3(
     in_channels=3,
     cls_mode=True,
     enable_flash=False,      # Disables the requirement for Ampere GPUs
     upcast_attention=True,   # Improves stability when flash is disabled
     upcast_softmax=True      # Improves stability when flash is disabled
 ).to(_DEVICE)
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
-criterion = nn.MSELoss()
 
-def train_step(env_batch, obj_batch):
-    model.train()
+# TODO: extract feaure_dim programmatically from backbone so that it's not hardcoded?
+classification_head = StabilityPredictor(feature_dim=512).to(_DEVICE)
+
+optimizer = torch.optim.AdamW(
+    list(backbone.parameters()) + list(classification_head.parameters()),
+    lr=1e-3,
+)
+criterion = nn.BCEWithLogitsLoss()
+
+def train_step(env_batch, obj_batch, label_batch):
+    backbone.train()
+    classification_head.train()
     optimizer.zero_grad()
 
     # Ensure shape is [B, 3, N]
@@ -63,15 +72,21 @@ def train_step(env_batch, obj_batch):
 
     # Forward through PTv3 backbone
     # model(xyz) handles serialization and sparsification internally
-    all_features = model(combined_input)
-    import pdb; pdb.set_trace()
+    all_features = backbone(combined_input)
 
     env_features, obj_features = torch.chunk(all_features, 2, dim=0)
 
-    loss = criterion(env_features, obj_features)
+    logits = classification_head(env_features, obj_features)
+
+    loss = criterion(logits, label_batch.view_as(logits).to(_DEVICE))
     loss.backward()
     optimizer.step()
     return loss.item()
+
+# Temporary hardcoded stability labels for the pointcloud data
+# TODO: save this info along with the pointcloud data so that it can be
+# loaded with the dataset
+pc_classification_labels = torch.cat((torch.ones(5), torch.zeros(5)))
 
 # Training Loop
 for i in range(_EPOCHS):
@@ -79,6 +94,21 @@ for i in range(_EPOCHS):
     idx = torch.randint(0, env_pcs.shape[0], (4,))
     batch_env = env_pcs[idx]
     batch_obj = obj_pcs[idx]
+    batch_classification_labels = pc_classification_labels[idx]
 
-    loss = train_step(batch_env, batch_obj)
+    loss = train_step(batch_env, batch_obj, batch_classification_labels)
     print(f"Epoch {i+1} loss: {loss:.6f}")
+print()
+
+# Test trained models
+# Since the same data is used for train / test, model should be "perfect"
+# (trying to see if we can overfit to prove that model architecture / pipeline works)
+env_batch = env_pcs.permute(0, 2, 1).to(_DEVICE)
+obj_batch = obj_pcs.permute(0, 2, 1).to(_DEVICE)
+combined_input = torch.cat([env_batch, obj_batch], dim=0)
+all_features = backbone(combined_input)
+env_features, obj_features = torch.chunk(all_features, 2, dim=0)
+logits = classification_head(env_features, obj_features)
+probabilities = torch.sigmoid(logits)
+print(f"Stability scores:\n{probabilities}")
+print(f"Ground-Truth Stability labels:\n{pc_classification_labels}")
