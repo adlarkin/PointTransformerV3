@@ -5,6 +5,8 @@ Pointcept detached version
 Author: Xiaoyang Wu (xiaoyang.wu.cs@gmail.com)
 Please cite our work if the code is helpful to you.
 """
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 import sys
 from functools import partial
@@ -14,7 +16,7 @@ import torch
 import torch.nn as nn
 import spconv.pytorch as spconv
 import torch_scatter
-from timm.models.layers import DropPath
+from timm.layers import DropPath
 from collections import OrderedDict
 
 try:
@@ -783,6 +785,25 @@ class Embedding(PointModule):
         return point
 
 
+class GlobalPool(nn.Module):
+    def __init__(self, pool_type="max"):
+        super().__init__()
+        assert pool_type in ["max", "mean", "mean+max"]
+        self.pool_type = pool_type
+
+    def forward(self, feat, batch):
+        # feat:  [N_feat, C] â€” N_feat varies per GPU due to voxel-based pooling
+        # batch: [N_feat]    â€” batch index per point, e.g. [0,0,...,1,1,...,B-1]
+        if self.pool_type == "max":
+            return torch_scatter.scatter(feat, batch, dim=0, reduce="max")   # [B, C]
+        elif self.pool_type == "mean":
+            return torch_scatter.scatter(feat, batch, dim=0, reduce="mean")  # [B, C]
+        elif self.pool_type == "mean+max":
+            return torch.cat([
+                torch_scatter.scatter(feat, batch, dim=0, reduce="mean"),
+                torch_scatter.scatter(feat, batch, dim=0, reduce="max"),
+            ], dim=-1)
+
 class PointTransformerV3(PointModule):
     def __init__(
         self,
@@ -963,7 +984,10 @@ class PointTransformerV3(PointModule):
                     )
                 self.dec.add(module=dec, name=f"dec{s}")
 
-    def forward(self, data_dict):
+        if self.cls_mode:
+            self.pooling = GlobalPool("max")
+
+    def forward(self, xyz):
         """
         A data_dict is a dictionary containing properties of a batched point cloud.
         It should contain the following properties for PTv3:
@@ -971,12 +995,31 @@ class PointTransformerV3(PointModule):
         2. "grid_coord": discrete coordinate after grid sampling (voxelization) or "coord" + "grid_size"
         3. "offset" or "batch": https://github.com/Pointcept/Pointcept?tab=readme-ov-file#offset
         """
+        # B: batch size * n_objects
+        # C: channel size (=3 for xyz)
+        # N: num of point cloud (128, 256, ...)
+        B, C, N = xyz.shape
+
+        # offset = indicating the cumulative number of points up to each object
+        # Here, assumes equal point cloud size per object.
+        # For variable-size point clouds, need to compute offset accordingly.
+        offset = torch.arange(1, B+1, device=xyz.device) * N  # (B,),
+        feat = xyz.permute(0,2,1).reshape(-1,C) # (B*N, C),
+
+        data_dict = {"feat": feat, # supposed to be other features (intensity, color, normal)
+                     "coord": feat,
+                     "grid_size": 0.01,
+                     "offset": offset
+                     }
+
         point = Point(data_dict)
         point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
         point.sparsify()
 
         point = self.embedding(point)
         point = self.enc(point)
-        if not self.cls_mode:
+        if not self.cls_mode: # for per-point feature
             point = self.dec(point)
-        return point
+        else: # to aggregate point features
+            point['feat'] = self.pooling(point['feat'], point.batch)
+        return point['feat']
