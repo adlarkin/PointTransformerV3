@@ -3,37 +3,49 @@ import torch.nn as nn
 import numpy as np
 from model import PointTransformerV3
 from stability_predictor import StabilityPredictor
+from torch.utils.data import Dataset, DataLoader
 
 _PC_SIZE = 256
-_EPOCHS = 100
+_EPOCHS = 50
+_SEED: int | None = 42
 
 _DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# TODO: figure out how to seed the random indexing / permutations below
-# (for reproducability)
+def load_pc_data(file: str, pc_size: int, seed: int | None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _resample(points, size, rng: np.random.Generator):
+        indices = rng.choice(len(points), size, replace=len(points) < size)
+        return points[indices]
 
-def load_pc_data(file: str) -> tuple[torch.Tensor, torch.Tensor]:
+    rng = np.random.default_rng(seed=seed)
+
     data = np.load(file, allow_pickle=True)
-    metadata = data["metadata"].item()
-    features = data["features"]
-    labels = data["labels"]
-
+    semantic_names_to_ids = data["semantic_names_to_ids"].item()
+    pointclouds = data["pointclouds"]
+    semantic_ids = data["semantic_ids"]
+    stability_labels = data["stability_labels"]
     env_list, obj_list = [], []
 
-    for pc, ids in zip(features, labels):
-        env_points = pc[ids == metadata["environment"]]
-        obj_points = pc[ids == metadata["object"]]
+    for pc, ids in zip(pointclouds, semantic_ids):
+        env_points = pc[ids == semantic_names_to_ids["environment"]]
+        obj_points = pc[ids == semantic_names_to_ids["object"]]
 
-        def resample(points, size):
-            indices = np.random.choice(len(points), size, replace=len(points) < size)
-            return points[indices]
+        env_list.append(torch.from_numpy(_resample(env_points, pc_size, rng)).float())
+        obj_list.append(torch.from_numpy(_resample(obj_points, pc_size, rng)).float())
 
-        env_list.append(torch.from_numpy(resample(env_points, _PC_SIZE)).float())
-        obj_list.append(torch.from_numpy(resample(obj_points, _PC_SIZE)).float())
+    return torch.stack(env_list), torch.stack(obj_list), torch.from_numpy(stability_labels).float()
 
-    return torch.stack(env_list), torch.stack(obj_list)
+class PointCloudPairDataset(Dataset):
+    def __init__(self, file_path: str, pc_size: int, seed: int | None):
+        self.env_pcs, self.obj_pcs, self.pc_pair_labels = load_pc_data("isaac_pc_data.npz", pc_size, seed)
+        assert self.env_pcs.shape == self.obj_pcs.shape
+        assert len(self.env_pcs) == len(self.pc_pair_labels)
 
-env_pcs, obj_pcs = load_pc_data("isaac_pc_data.npz")
+    def __len__(self):
+        return len(self.env_pcs)
+
+    def __getitem__(self, idx):
+        return self.env_pcs[idx], self.obj_pcs[idx], self.pc_pair_labels[idx]
+
 
 # NOTE: setting enable_flash=False because my GPU does not support it.
 # Running with enable_flash=True gives the following error:
@@ -49,8 +61,13 @@ backbone = PointTransformerV3(
     upcast_softmax=True      # Improves stability when flash is disabled
 ).to(_DEVICE)
 
-# TODO: extract feaure_dim programmatically from backbone so that it's not hardcoded?
-classification_head = StabilityPredictor(feature_dim=512).to(_DEVICE)
+# the feature_dim extraction below assumes the backbone is in cls_mode.
+# feature_dim is the dimension of the backbone output (pointcloud embedding)
+assert backbone.cls_mode
+last_stage = backbone.enc[-1]
+last_block = last_stage[-1]
+feature_dim = last_block.channels
+classification_head = StabilityPredictor(feature_dim=feature_dim).to(_DEVICE)
 
 optimizer = torch.optim.AdamW(
     list(backbone.parameters()) + list(classification_head.parameters()),
@@ -70,9 +87,10 @@ def train_step(env_batch, obj_batch, label_batch):
     # Concatenate for parallel processing [2*B, 3, 256]
     combined_input = torch.cat([env_batch, obj_batch], dim=0)
 
-    # Forward through PTv3 backbone
+    # Forward through PTv3 backbone.
     # model(xyz) handles serialization and sparsification internally
     all_features = backbone(combined_input)
+    assert all_features.shape == ((len(env_batch) + len(obj_batch)), feature_dim)
 
     env_features, obj_features = torch.chunk(all_features, 2, dim=0)
 
@@ -83,26 +101,21 @@ def train_step(env_batch, obj_batch, label_batch):
     optimizer.step()
     return loss.item()
 
-# Temporary hardcoded stability labels for the pointcloud data
-# TODO: save this info along with the pointcloud data so that it can be
-# loaded with the dataset
-pc_classification_labels = torch.cat((torch.ones(5), torch.zeros(5)))
+dataset = PointCloudPairDataset("isaac_pc_data.npz", _PC_SIZE, _SEED)
+train_loader = DataLoader(dataset, batch_size=16, shuffle=True)
 
 # Training Loop
 for i in range(_EPOCHS):
-    # Select a random batch (here size 4)
-    idx = torch.randint(0, env_pcs.shape[0], (4,))
-    batch_env = env_pcs[idx]
-    batch_obj = obj_pcs[idx]
-    batch_classification_labels = pc_classification_labels[idx]
-
-    loss = train_step(batch_env, batch_obj, batch_classification_labels)
-    print(f"Epoch {i+1} loss: {loss:.6f}")
+    loss = 0
+    for _, (batch_env, batch_obj, batch_labels) in enumerate(train_loader):
+        loss += train_step(batch_env, batch_obj, batch_labels)
+    print(f"Epoch {i+1} average loss: {loss / len(train_loader):.6f}")
 print()
 
 # Test trained models
 # Since the same data is used for train / test, model should be "perfect"
 # (trying to see if we can overfit to prove that model architecture / pipeline works)
+env_pcs, obj_pcs, pc_pair_labels = load_pc_data("isaac_pc_data.npz", _PC_SIZE, _SEED)
 env_batch = env_pcs.permute(0, 2, 1).to(_DEVICE)
 obj_batch = obj_pcs.permute(0, 2, 1).to(_DEVICE)
 combined_input = torch.cat([env_batch, obj_batch], dim=0)
@@ -111,4 +124,4 @@ env_features, obj_features = torch.chunk(all_features, 2, dim=0)
 logits = classification_head(env_features, obj_features)
 probabilities = torch.sigmoid(logits)
 print(f"Stability scores:\n{probabilities}")
-print(f"Ground-Truth Stability labels:\n{pc_classification_labels}")
+print(f"Ground-Truth Stability labels:\n{dataset.pc_pair_labels}")
