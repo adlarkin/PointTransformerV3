@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling >= 1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ptv3"
+version = "0.0.0"
+# TODO: add these dependencies
+#
+# torch-scatter: https://pypi.org/project/torch-scatter/
+# 	- link below depends on local pytorch and cuda install
+#	  (TODO figure out how to handle this during install time)
+# `uv pip install torch-scatter -f https://data.pyg.org/whl/torch-2.7.0+cu126.html`
+#
+# FlashAttention (if GPU supports it - it's listed as optional in PTv3 repo)
+# https://github.com/Dao-AILab/flash-attention?tab=readme-ov-file#installation-and-features
+# `uv pip install flash-attn --no-build-isolation`
+dependencies = [
+  "addict",
+  # This assumes CUDA 12.X is installed: https://pypi.org/project/spconv/
+  # TODO: read from system to detect CUDA version and enforce that here?
+  # (or require an environment variable to be set)
+  "spconv-cu120",
+  "timm",
+  "torch"
+]
+requires-python = ">=3.9"
+
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+  # pyflakes
+  "F",
+  # pycodestyle
+  "E",
+  "W",
+  # isort
+  "I"
+]
+ignore = [
+  # Line too long.
+  "E501"
+]
