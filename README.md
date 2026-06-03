@@ -1,3 +1,24 @@
+# Installation
+Requires [uv](https://docs.astral.sh/uv/).
+
+This is a work in progress.
+For now, instructions assume cuda 12.X.
+
+TODO: clean up `pyproject.toml` so that everything can be installed in one command
+
+```
+# this will install most dependencies
+uv pip install -e .
+
+# install torch-scatter. Notice that the link has a specified torch and cuda version.
+# the link may need to be changed based on the torch/cuda versions in your env
+uv pip install torch-scatter -f https://data.pyg.org/whl/torch-2.7.0+cu126.html
+
+# if GPU supports it, install FlashAttention. Additional info:
+# https://github.com/Dao-AILab/flash-attention?tab=readme-ov-file#installation-and-features
+uv pip install flash-attn --no-build-isolation
+```
+
 # Point Transformer V3
 This repo is the official project repository of the paper **_Point Transformer V3: Simpler, Faster, Stronger_** and is mainly used for releasing schedules, updating instructions, sharing experiment records (containing model weight), and handling issues. The code will be updated in _[Pointcept](https://github.com/Pointcept/Pointcept) v1.5_.  
 [ Backbone ] [PTv3] - [ [arXiv](https://arxiv.org/abs/2312.10035) ] [ [Bib](https://xywu.me/research/ptv3/bib.txt) ] [ [Code](https://github.com/Pointcept/Pointcept) ]  
